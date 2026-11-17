@@ -52,6 +52,12 @@ func segmentByteRangeStart(segments []*playlist.MediaSegment, pos int) uint64 {
 }
 
 func dateTimeOfPreloadHint(pl *playlist.Media) *time.Time {
+	return dateTimeOfPart(pl, len(pl.Parts))
+}
+
+// dateTimeOfPart returns the wall-clock start time of the part
+// at position partIdx of the in-progress segment.
+func dateTimeOfPart(pl *playlist.Media, partIdx int) *time.Time {
 	if len(pl.Segments) == 0 {
 		return nil
 	}
@@ -63,8 +69,8 @@ func dateTimeOfPreloadHint(pl *playlist.Media) *time.Time {
 
 	d := lastSeg.DateTime.Add(lastSeg.Duration)
 
-	for _, part := range pl.Parts {
-		d = d.Add(part.Duration)
+	for i := 0; i < partIdx; i++ {
+		d = d.Add(pl.Parts[i].Duration)
 	}
 
 	return &d
@@ -80,6 +86,7 @@ type clientStreamDownloader struct {
 	isLeading                bool
 	startDistance            int
 	maxDistance              int
+	startDateTime            *time.Time
 	httpClient               *http.Client
 	onRequest                ClientOnRequestFunc
 	onDownloadStreamPlaylist ClientOnDownloadStreamPlaylistFunc
@@ -179,6 +186,18 @@ func (d *clientStreamDownloader) run(errGroupCtx context.Context) error {
 func (d *clientStreamDownloader) runLowLatency(errGroupCtx context.Context) error {
 	pl := d.firstPlaylist
 
+	if d.startDateTime != nil {
+		var err error
+		pl, err = d.runLowLatencyCatchUp(errGroupCtx, pl)
+		if err != nil {
+			return err
+		}
+
+		if pl.PreloadHint == nil {
+			return fmt.Errorf("preload hint disappeared")
+		}
+	}
+
 	for {
 		byts, err := d.downloadPreloadHint(errGroupCtx, pl.PreloadHint)
 		if err != nil {
@@ -201,17 +220,79 @@ func (d *clientStreamDownloader) runLowLatency(errGroupCtx context.Context) erro
 	}
 }
 
+// runLowLatencyCatchUp downloads all segments and parts from the one that
+// contains the requested start time up to the live edge,
+// then returns a refreshed playlist.
+func (d *clientStreamDownloader) runLowLatencyCatchUp(
+	errGroupCtx context.Context,
+	pl *playlist.Media,
+) (*playlist.Media, error) {
+	segPos, segStart, partPos, err := findSegmentWithDateTime(pl.Segments, pl.Parts, *d.startDateTime)
+	if err != nil {
+		return nil, err
+	}
+
+	// download complete segments, starting from the one that contains the requested time
+	for i := segPos; i < len(pl.Segments); i++ {
+		seg := pl.Segments[i]
+
+		var byts []byte
+		byts, err = d.downloadSegment(errGroupCtx, seg.URI,
+			new(segmentByteRangeStart(pl.Segments, i)), seg.ByteRangeLength)
+		if err != nil {
+			return nil, err
+		}
+
+		dateTime := seg.DateTime
+		if i == segPos {
+			dateTime = segStart
+		}
+
+		d.segmentQueue.push(&segmentData{
+			dateTime: dateTime,
+			payload:  byts,
+		})
+
+		ok := d.segmentQueue.waitUntilSizeIsBelow(errGroupCtx, 1)
+		if !ok {
+			return nil, fmt.Errorf("terminated")
+		}
+	}
+
+	// download parts of the in-progress segment, starting from the one
+	// that contains the requested time
+	partStart := 0
+	if segPos == len(pl.Segments) {
+		partStart = partPos
+	}
+
+	for i := partStart; i < len(pl.Parts); i++ {
+		var byts []byte
+		byts, err = d.downloadPart(errGroupCtx, pl.Parts[i])
+		if err != nil {
+			return nil, err
+		}
+
+		d.segmentQueue.push(&segmentData{
+			dateTime: dateTimeOfPart(pl, i),
+			payload:  byts,
+		})
+	}
+
+	return d.downloadPlaylist(errGroupCtx, d.firstPlaylist.ServerControl.CanSkipUntil != nil)
+}
+
 func (d *clientStreamDownloader) runTraditional(errGroupCtx context.Context) error {
 	pl := d.firstPlaylist
 
 	for {
-		seg, payload, err := d.downloadNextSegment(errGroupCtx, pl)
+		_, dateTime, payload, err := d.downloadNextSegment(errGroupCtx, pl)
 		if err != nil {
 			return err
 		}
 
 		d.segmentQueue.push(&segmentData{
-			dateTime: seg.DateTime,
+			dateTime: dateTime,
 			payload:  payload,
 		})
 
@@ -275,14 +356,41 @@ func (d *clientStreamDownloader) downloadPreloadHint(
 
 	d.onDownloadPart(u.String())
 
+	return d.downloadPartChunk(errGroupCtx, u, new(preloadHint.ByteRangeStart), preloadHint.ByteRangeLength)
+}
+
+func (d *clientStreamDownloader) downloadPart(
+	errGroupCtx context.Context,
+	part *playlist.MediaPart,
+) ([]byte, error) {
+	u, err := clientAbsoluteURL(d.playlistURL, part.URI)
+	if err != nil {
+		return nil, err
+	}
+
+	d.onDownloadPart(u.String())
+
+	return d.downloadPartChunk(errGroupCtx, u, part.ByteRangeStart, part.ByteRangeLength)
+}
+
+func (d *clientStreamDownloader) downloadPartChunk(
+	errGroupCtx context.Context,
+	u *url.URL,
+	byteRangeStart *uint64,
+	byteRangeLength *uint64,
+) ([]byte, error) {
 	req, err := http.NewRequestWithContext(errGroupCtx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if preloadHint.ByteRangeLength != nil {
-		req.Header.Add("Range", "bytes="+strconv.FormatUint(preloadHint.ByteRangeStart, 10)+
-			"-"+strconv.FormatUint(preloadHint.ByteRangeStart+*preloadHint.ByteRangeLength-1, 10))
+	if byteRangeLength != nil {
+		start := uint64(0)
+		if byteRangeStart != nil {
+			start = *byteRangeStart
+		}
+		req.Header.Add("Range", "bytes="+strconv.FormatUint(start, 10)+
+			"-"+strconv.FormatUint(start+*byteRangeLength-1, 10))
 	}
 
 	d.onRequest(req)
@@ -354,23 +462,41 @@ func (d *clientStreamDownloader) downloadSegment(
 func (d *clientStreamDownloader) downloadNextSegment(
 	errGroupCtx context.Context,
 	pl *playlist.Media,
-) (*playlist.MediaSegment, []byte, error) {
+) (*playlist.MediaSegment, *time.Time, []byte, error) {
 	var seg *playlist.MediaSegment
 	var segPos int
+	var segDateTime *time.Time
 
 	if d.curSegmentID == nil {
-		if (d.firstPlaylist.PlaylistType != nil &&
+		if d.startDateTime != nil {
+			// start from the segment that contains the requested wall-clock time
+			var segStart *time.Time
+			var err error
+			segPos, segStart, _, err = findSegmentWithDateTime(pl.Segments, pl.Parts, *d.startDateTime)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+
+			if segPos >= len(pl.Segments) {
+				return nil, nil, nil, fmt.Errorf(
+					"%w: time is inside the in-progress segment, which is not available yet",
+					ErrClientDateTimeNotFound)
+			}
+
+			seg = pl.Segments[segPos]
+			segDateTime = segStart
+		} else if (d.firstPlaylist.PlaylistType != nil &&
 			*d.firstPlaylist.PlaylistType == playlist.MediaPlaylistTypeVOD) || d.firstPlaylist.Endlist {
 			// VOD stream: start from the beginning
 			if len(pl.Segments) == 0 {
-				return nil, nil, fmt.Errorf("no segments found")
+				return nil, nil, nil, fmt.Errorf("no segments found")
 			}
 			seg = pl.Segments[0]
 		} else {
 			// live stream: start from clientLiveInitialDistance
 			seg, segPos = findSegmentWithInvPosition(pl.Segments, d.startDistance)
 			if seg == nil {
-				return nil, nil, fmt.Errorf("there aren't enough segments to fill the buffer")
+				return nil, nil, nil, fmt.Errorf("there aren't enough segments to fill the buffer")
 			}
 		}
 	} else {
@@ -378,14 +504,18 @@ func (d *clientStreamDownloader) downloadNextSegment(
 		seg, segPos, invPos = findSegmentWithID(pl.MediaSequence, pl.Segments, *d.curSegmentID+1)
 		if seg == nil {
 			if pl.Endlist {
-				return nil, nil, ErrClientEOS
+				return nil, nil, nil, ErrClientEOS
 			}
-			return nil, nil, fmt.Errorf("next segment not found or not ready yet")
+			return nil, nil, nil, fmt.Errorf("next segment not found or not ready yet")
 		}
 
 		if !pl.Endlist && invPos > d.maxDistance {
-			return nil, nil, fmt.Errorf("playback is too late")
+			return nil, nil, nil, fmt.Errorf("playback is too late")
 		}
+	}
+
+	if segDateTime == nil {
+		segDateTime = seg.DateTime
 	}
 
 	d.curSegmentID = new(pl.MediaSequence + segPos)
@@ -393,10 +523,10 @@ func (d *clientStreamDownloader) downloadNextSegment(
 	byts, err := d.downloadSegment(errGroupCtx, seg.URI,
 		new(segmentByteRangeStart(pl.Segments, segPos)), seg.ByteRangeLength)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return seg, byts, nil
+	return seg, segDateTime, byts, nil
 }
 
 func (d *clientStreamDownloader) startStreaming(

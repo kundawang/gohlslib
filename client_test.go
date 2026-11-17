@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2951,4 +2953,562 @@ func TestClientLifecycleErrorBeforeTracks(t *testing.T) {
 			require.Contains(t, err.Error(), "404")
 		})
 	}
+}
+
+func TestClientStartDateTime(t *testing.T) {
+	segStart := time.Date(2015, time.February, 5, 1, 2, 2, 0, time.UTC)
+
+	writeMPEGTSSegment := func(t *testing.T, w http.ResponseWriter, dts int64) {
+		t.Helper()
+		w.Header().Set("Content-Type", `video/MP2T`)
+
+		h264Track := &mpegts.Track{
+			Codec: &tscodecs.H264{},
+		}
+		mw := &mpegts.Writer{W: w, Tracks: []*mpegts.Track{h264Track}}
+		err := mw.Initialize()
+		require.NoError(t, err)
+
+		err = mw.WriteH264(
+			h264Track,
+			dts,
+			dts,
+			[][]byte{
+				{7, 1, 2, 3}, // SPS
+				{8},          // PPS
+				{5},          // IDR
+			},
+		)
+		require.NoError(t, err)
+	}
+
+	t.Run("static", func(t *testing.T) {
+		var segRequests []string
+		recv := make(chan struct{})
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/index.m3u8":
+				w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+				w.Write([]byte("#EXTM3U\n" +
+					"#EXT-X-VERSION:3\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MEDIA-SEQUENCE:0\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+					"#EXTINF:2,\n" +
+					"segment1.ts\n" +
+					"#EXTINF:2,\n" +
+					"segment2.ts\n" +
+					"#EXTINF:2,\n" +
+					"segment3.ts\n" +
+					"#EXT-X-ENDLIST\n"))
+
+			case "/segment1.ts":
+				segRequests = append(segRequests, r.URL.Path)
+				writeMPEGTSSegment(t, w, 0)
+
+			case "/segment2.ts":
+				segRequests = append(segRequests, r.URL.Path)
+				writeMPEGTSSegment(t, w, 2*90000)
+
+			case "/segment3.ts":
+				segRequests = append(segRequests, r.URL.Path)
+				writeMPEGTSSegment(t, w, 4*90000)
+			}
+		}))
+		defer server.Close()
+
+		var c *gohlslib.Client
+		c = &gohlslib.Client{
+			URI:           server.URL + "/index.m3u8",
+			StartDateTime: new(segStart.Add(2500 * time.Millisecond)),
+			OnTracks: func(tracks []*gohlslib.Track) error {
+				c.OnDataH26x(tracks[0], func(_ int64, _ int64, _ [][]byte) {
+					select {
+					case <-recv:
+					default:
+						// the first sample must be at the (derived) start of segment2
+						ntp, ok := c.AbsoluteTime(tracks[0])
+						require.True(t, ok)
+						require.Equal(t, segStart.Add(2*time.Second), ntp)
+						close(recv)
+					}
+				})
+				return nil
+			},
+		}
+		err := c.Start()
+		require.NoError(t, err)
+		defer c.Close()
+
+		<-recv
+
+		err = c.Wait2()
+		require.ErrorIs(t, err, gohlslib.ErrClientEOS)
+
+		// old segments before the requested time must not have been downloaded
+		require.Equal(t, []string{"/segment2.ts", "/segment3.ts"}, segRequests)
+	})
+
+	t.Run("static multivariant", func(t *testing.T) {
+		var mutex sync.Mutex
+		segRequests := make(map[string]int)
+		videoRecv := make(chan struct{})
+		audioRecv := make(chan struct{})
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/index.m3u8":
+				w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+				w.Write([]byte("#EXTM3U\n" +
+					"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\"," +
+					"DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"en\",URI=\"audio.m3u8\"\n" +
+					"#EXT-X-STREAM-INF:BANDWIDTH=7680000,CODECS=\"avc1.640015,mp4a.40.5\",AUDIO=\"aac\"\n" +
+					"video.m3u8\n"))
+
+			case "/video.m3u8":
+				w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+				w.Write([]byte("#EXTM3U\n" +
+					"#EXT-X-VERSION:7\n" +
+					"#EXT-X-MEDIA-SEQUENCE:0\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXT-X-INDEPENDENT-SEGMENTS\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MAP:URI=\"init_video.mp4\"\n" +
+					"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+					"#EXTINF:2,\n" +
+					"segment_video1.mp4\n" +
+					"#EXTINF:2,\n" +
+					"segment_video2.mp4\n" +
+					"#EXT-X-ENDLIST\n"))
+
+			case "/audio.m3u8":
+				w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+				w.Write([]byte("#EXTM3U\n" +
+					"#EXT-X-VERSION:7\n" +
+					"#EXT-X-MEDIA-SEQUENCE:0\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXT-X-INDEPENDENT-SEGMENTS\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MAP:URI=\"init_audio.mp4\"\n" +
+					"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+					"#EXTINF:2,\n" +
+					"segment_audio1.mp4\n" +
+					"#EXTINF:2,\n" +
+					"segment_audio2.mp4\n" +
+					"#EXT-X-ENDLIST\n"))
+
+			case "/init_video.mp4":
+				w.Header().Set("Content-Type", `video/mp4`)
+				err := mp4ToWriter(&fmp4.Init{
+					Tracks: []*fmp4.InitTrack{
+						{
+							ID:        1,
+							TimeScale: 90000,
+							Codec: &mp4codecs.H264{
+								SPS: testH264SPS,
+								PPS: testH264PPS,
+							},
+						},
+					},
+				}, w)
+				require.NoError(t, err)
+
+			case "/init_audio.mp4":
+				w.Header().Set("Content-Type", `video/mp4`)
+				err := mp4ToWriter(&fmp4.Init{
+					Tracks: []*fmp4.InitTrack{
+						{
+							ID:        1,
+							TimeScale: 44100,
+							Codec: &mp4codecs.MPEG4Audio{
+								Config: testAACConfig,
+							},
+						},
+					},
+				}, w)
+				require.NoError(t, err)
+
+			case "/segment_video1.mp4", "/segment_video2.mp4":
+				mutex.Lock()
+				segRequests[r.URL.Path]++
+				mutex.Unlock()
+
+				baseTime := uint64(0)
+				if r.URL.Path == "/segment_video2.mp4" {
+					baseTime = 2 * 90000
+				}
+
+				w.Header().Set("Content-Type", `video/mp4`)
+				err := mp4ToWriter(&fmp4.Part{
+					Tracks: []*fmp4.PartTrack{
+						{
+							ID:       1,
+							BaseTime: baseTime,
+							Samples: []*fmp4.Sample{
+								{
+									Duration: 90000 / 30,
+									Payload: mustMarshalAVCC([][]byte{
+										{7, 1, 2, 3}, // SPS
+										{8},          // PPS
+										{5},          // IDR
+									}),
+								},
+							},
+						},
+					},
+				}, w)
+				require.NoError(t, err)
+
+			case "/segment_audio1.mp4", "/segment_audio2.mp4":
+				mutex.Lock()
+				segRequests[r.URL.Path]++
+				mutex.Unlock()
+
+				baseTime := uint64(0)
+				if r.URL.Path == "/segment_audio2.mp4" {
+					baseTime = 2 * 44100
+				}
+
+				w.Header().Set("Content-Type", `video/mp4`)
+				err := mp4ToWriter(&fmp4.Part{
+					Tracks: []*fmp4.PartTrack{
+						{
+							ID:       1,
+							BaseTime: baseTime,
+							Samples: []*fmp4.Sample{
+								{
+									Duration: 44100 / 30,
+									Payload:  []byte{1, 2, 3, 4},
+								},
+							},
+						},
+					},
+				}, w)
+				require.NoError(t, err)
+			}
+		}))
+		defer server.Close()
+
+		var c *gohlslib.Client
+		c = &gohlslib.Client{
+			URI:           server.URL + "/index.m3u8",
+			StartDateTime: new(segStart.Add(2500 * time.Millisecond)),
+			OnTracks: func(tracks []*gohlslib.Track) error {
+				require.Equal(t, 2, len(tracks))
+
+				for _, track := range tracks {
+					switch track.Codec.(type) {
+					case *codecs.H264:
+						c.OnDataH26x(track, func(_ int64, _ int64, _ [][]byte) {
+							select {
+							case <-videoRecv:
+							default:
+								ntp, ok := c.AbsoluteTime(track)
+								require.True(t, ok)
+								require.Equal(t, segStart.Add(2*time.Second), ntp)
+								close(videoRecv)
+							}
+						})
+
+					case *codecs.MPEG4Audio:
+						c.OnDataMPEG4Audio(track, func(_ int64, _ [][]byte) {
+							select {
+							case <-audioRecv:
+							default:
+								ntp, ok := c.AbsoluteTime(track)
+								require.True(t, ok)
+								require.Equal(t, segStart.Add(2*time.Second), ntp)
+								close(audioRecv)
+							}
+						})
+					}
+				}
+
+				return nil
+			},
+		}
+		err := c.Start()
+		require.NoError(t, err)
+		defer c.Close()
+
+		<-videoRecv
+		<-audioRecv
+
+		err = c.Wait2()
+		require.ErrorIs(t, err, gohlslib.ErrClientEOS)
+
+		// both tracks must have started at the segment that covers the requested time
+		mutex.Lock()
+		require.Equal(t, map[string]int{
+			"/segment_video2.mp4": 1,
+			"/segment_audio2.mp4": 1,
+		}, segRequests)
+		mutex.Unlock()
+	})
+
+	t.Run("sliding", func(t *testing.T) {
+		var playlistCount atomic.Int32
+		segRequests := make(chan string, 10)
+		recv := make(chan struct{})
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/index.m3u8":
+				w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+
+				if playlistCount.Add(1) == 1 {
+					w.Write([]byte("#EXTM3U\n" +
+						"#EXT-X-VERSION:3\n" +
+						"#EXT-X-TARGETDURATION:2\n" +
+						"#EXT-X-MEDIA-SEQUENCE:10\n" +
+						"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+						"#EXTINF:2,\n" +
+						"segment10.ts\n" +
+						"#EXTINF:2,\n" +
+						"segment11.ts\n" +
+						"#EXTINF:2,\n" +
+						"segment12.ts\n" +
+						"#EXTINF:2,\n" +
+						"segment13.ts\n" +
+						"#EXTINF:2,\n" +
+						"segment14.ts\n"))
+				} else {
+					// the window has slid by one segment
+					w.Write([]byte("#EXTM3U\n" +
+						"#EXT-X-VERSION:3\n" +
+						"#EXT-X-TARGETDURATION:2\n" +
+						"#EXT-X-MEDIA-SEQUENCE:11\n" +
+						"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:04Z\n" +
+						"#EXTINF:2,\n" +
+						"segment11.ts\n" +
+						"#EXTINF:2,\n" +
+						"segment12.ts\n" +
+						"#EXTINF:2,\n" +
+						"segment13.ts\n" +
+						"#EXTINF:2,\n" +
+						"segment14.ts\n" +
+						"#EXTINF:2,\n" +
+						"segment15.ts\n"))
+				}
+
+			default:
+				var segNum int
+				_, err := fmt.Sscanf(r.URL.Path, "/segment%d.ts", &segNum)
+				if err != nil {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+
+				segRequests <- r.URL.Path
+				writeMPEGTSSegment(t, w, int64(segNum-10)*2*90000)
+			}
+		}))
+		defer server.Close()
+
+		var c *gohlslib.Client
+		c = &gohlslib.Client{
+			URI:           server.URL + "/index.m3u8",
+			StartDateTime: new(segStart.Add(5 * time.Second)),
+			OnTracks: func(tracks []*gohlslib.Track) error {
+				c.OnDataH26x(tracks[0], func(_ int64, _ int64, _ [][]byte) {
+					select {
+					case <-recv:
+					default:
+						// the first sample must be at the (derived) start of segment12
+						ntp, ok := c.AbsoluteTime(tracks[0])
+						require.True(t, ok)
+						require.Equal(t, segStart.Add(4*time.Second), ntp)
+						close(recv)
+					}
+				})
+				return nil
+			},
+		}
+		err := c.Start()
+		require.NoError(t, err)
+		defer c.Close()
+
+		// the first downloaded segment must be the one that covers the requested time
+		require.Equal(t, "/segment12.ts", <-segRequests)
+
+		<-recv
+	})
+
+	t.Run("backward derivation", func(t *testing.T) {
+		segRequests := make(chan string, 10)
+		recv := make(chan struct{})
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/index.m3u8":
+				w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+				w.Write([]byte("#EXTM3U\n" +
+					"#EXT-X-VERSION:3\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MEDIA-SEQUENCE:0\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXTINF:2,\n" +
+					"segment1.ts\n" +
+					"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+					"#EXTINF:2,\n" +
+					"segment2.ts\n" +
+					"#EXT-X-ENDLIST\n"))
+
+			case "/segment1.ts":
+				segRequests <- r.URL.Path
+				writeMPEGTSSegment(t, w, 0)
+
+			case "/segment2.ts":
+				segRequests <- r.URL.Path
+				writeMPEGTSSegment(t, w, 2*90000)
+			}
+		}))
+		defer server.Close()
+
+		var c *gohlslib.Client
+		c = &gohlslib.Client{
+			URI:           server.URL + "/index.m3u8",
+			StartDateTime: new(segStart.Add(-1 * time.Second)),
+			OnTracks: func(tracks []*gohlslib.Track) error {
+				c.OnDataH26x(tracks[0], func(_ int64, _ int64, _ [][]byte) {
+					select {
+					case <-recv:
+					default:
+						// segment1 has no anchor: its start time must be
+						// derived backward from segment2
+						ntp, ok := c.AbsoluteTime(tracks[0])
+						require.True(t, ok)
+						require.Equal(t, segStart.Add(-2*time.Second), ntp)
+						close(recv)
+					}
+				})
+				return nil
+			},
+		}
+		err := c.Start()
+		require.NoError(t, err)
+		defer c.Close()
+
+		require.Equal(t, "/segment1.ts", <-segRequests)
+
+		<-recv
+	})
+
+	t.Run("errors", func(t *testing.T) {
+		for _, ca := range []struct {
+			name     string
+			playlist string
+			target   time.Time
+			expected string
+		}{
+			{
+				"before window",
+				"#EXTM3U\n" +
+					"#EXT-X-VERSION:3\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MEDIA-SEQUENCE:5\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+					"#EXTINF:2,\n" +
+					"segment1.ts\n" +
+					"#EXT-X-ENDLIST\n",
+				segStart.Add(-1 * time.Second),
+				"requested start time not found in playlist: " +
+					"time is before the start of the playlist window",
+			},
+			{
+				"after window",
+				"#EXTM3U\n" +
+					"#EXT-X-VERSION:3\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MEDIA-SEQUENCE:5\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+					"#EXTINF:2,\n" +
+					"segment1.ts\n" +
+					"#EXT-X-ENDLIST\n",
+				segStart.Add(100 * time.Second),
+				"requested start time not found in playlist: " +
+					"time is after the end of the playlist window",
+			},
+			{
+				"no anchor",
+				"#EXTM3U\n" +
+					"#EXT-X-VERSION:3\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MEDIA-SEQUENCE:5\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXTINF:2,\n" +
+					"segment1.ts\n" +
+					"#EXT-X-ENDLIST\n",
+				segStart,
+				"requested start time not found in playlist: " +
+					"playlist has no EXT-X-PROGRAM-DATE-TIME",
+			},
+			{
+				// the segment before the discontinuity has no anchor and
+				// its start time must not be derived across the discontinuity
+				"across discontinuity",
+				"#EXTM3U\n" +
+					"#EXT-X-VERSION:3\n" +
+					"#EXT-X-TARGETDURATION:2\n" +
+					"#EXT-X-MEDIA-SEQUENCE:5\n" +
+					"#EXT-X-PLAYLIST-TYPE:VOD\n" +
+					"#EXTINF:2,\n" +
+					"segment1.ts\n" +
+					"#EXT-X-DISCONTINUITY\n" +
+					"#EXT-X-PROGRAM-DATE-TIME:2015-02-05T01:02:02Z\n" +
+					"#EXTINF:2,\n" +
+					"segment2.ts\n" +
+					"#EXT-X-ENDLIST\n",
+				segStart.Add(-1 * time.Second),
+				"requested start time not found in playlist: " +
+					"time is before the start of the playlist window",
+			},
+		} {
+			t.Run(ca.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", `application/vnd.apple.mpegurl`)
+					w.Write([]byte(ca.playlist))
+				}))
+				defer server.Close()
+
+				c := &gohlslib.Client{
+					URI:           server.URL + "/index.m3u8",
+					StartDateTime: new(ca.target),
+				}
+				err := c.Start()
+				require.NoError(t, err)
+				defer c.Close()
+
+				err = c.Wait2()
+				require.EqualError(t, err, ca.expected)
+				require.ErrorIs(t, err, gohlslib.ErrClientDateTimeNotFound)
+			})
+		}
+	})
+
+	t.Run("close", func(t *testing.T) {
+		requested := make(chan struct{})
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			close(requested)
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+
+		c := &gohlslib.Client{
+			URI:           server.URL + "/index.m3u8",
+			StartDateTime: new(segStart),
+		}
+		require.NoError(t, c.Start())
+
+		<-requested
+		c.Close()
+		require.EqualError(t, c.Wait2(), "terminated")
+	})
 }

@@ -96,6 +96,14 @@ type Client struct {
 	// expressed as number of segments.
 	// It defaults to 5.
 	MaxDistance int
+	// StartDateTime is the wall-clock time at which to start playback,
+	// matched against EXT-X-PROGRAM-DATE-TIME tags of the playlist.
+	// When set, the first downloaded segment or part is the one that
+	// contains this time, instead of the one at the live edge or
+	// at the beginning of the playlist. All streams of a multivariant
+	// playlist are started at the same wall-clock time.
+	// It defaults to nil (disabled).
+	StartDateTime *time.Time
 	// HTTP client.
 	// It defaults to a new http.Client with cookies enabled.
 	HTTPClient *http.Client
@@ -298,6 +306,7 @@ func (c *Client) runInner() error {
 		primaryPlaylistURL:        c.playlistURL,
 		startDistance:             c.StartDistance,
 		maxDistance:               c.MaxDistance,
+		startDateTime:             c.StartDateTime,
 		httpClient:                c.HTTPClient,
 		errGroup:                  errGroup,
 		onRequest:                 c.OnRequest,

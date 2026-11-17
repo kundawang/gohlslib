@@ -127,6 +127,7 @@ type clientPrimaryDownloader struct {
 	primaryPlaylistURL        *url.URL
 	startDistance             int
 	maxDistance               int
+	startDateTime             *time.Time
 	httpClient                *http.Client
 	errGroup                  *errgroup.Group
 	onRequest                 ClientOnRequestFunc
@@ -194,6 +195,7 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 			isLeading:                true,
 			startDistance:            d.startDistance,
 			maxDistance:              d.maxDistance,
+			startDateTime:            d.startDateTime,
 			httpClient:               d.httpClient,
 			onRequest:                d.onRequest,
 			onDownloadStreamPlaylist: d.onDownloadStreamPlaylist,
@@ -229,6 +231,7 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 			isLeading:                true,
 			startDistance:            d.startDistance,
 			maxDistance:              d.maxDistance,
+			startDateTime:            d.startDateTime,
 			httpClient:               d.httpClient,
 			onRequest:                d.onRequest,
 			onDownloadStreamPlaylist: d.onDownloadStreamPlaylist,
@@ -271,6 +274,7 @@ func (d *clientPrimaryDownloader) run(errGroupCtx context.Context) error {
 						onRequest:                d.onRequest,
 						startDistance:            d.startDistance,
 						maxDistance:              d.maxDistance,
+						startDateTime:            d.startDateTime,
 						httpClient:               d.httpClient,
 						onDownloadStreamPlaylist: d.onDownloadStreamPlaylist,
 						onDownloadSegment:        d.onDownloadSegment,
